@@ -2,21 +2,17 @@
 ResearchPilot API Main Application Entry Point.
 
 ===============================================================================
-EXPRESS / NODE.JS VS. FASTAPI APPLICATION SETUP
+EXPRESS / NODE.JS VS. FASTAPI PRODUCTION ARCHITECTURE
 ===============================================================================
-In Node.js / Express:
-  - `const app = express();` initializes an Express app instance.
-  - Middlewares are mounted via `app.use(cors())`, `app.use(express.json())`.
-  - Routers are mounted via `app.use('/api/v1/chat', chatRouter)`.
-  - The server starts via `app.listen(port, () => ...)` running on single-threaded event loop.
+In Node.js:
+  - PM2 or Cluster module spawns multiple Node process instances.
 
-In FastAPI / Python (ASGI Web Standard):
-  - `app = FastAPI(lifespan=lifespan)` initializes the web application.
-  - ASGI (Asynchronous Server Gateway Interface) standard allows asynchronous Python servers (like Uvicorn)
-    to handle thousands of concurrent HTTP, SSE, and WebSocket connections efficiently.
-  - OpenAPI (Swagger UI) documentation is generated automatically from Pydantic schemas and type hints at `/docs`.
-  - Middlewares (like `CORSMiddleware`) wrap the ASGI application stack cleanly.
-  - `app.include_router(chat.router, prefix=settings.API_V1_STR)` mounts modular routers.
+In FastAPI / Python (Gunicorn + Uvicorn Worker Process Manager):
+  - Gunicorn acts as a master process manager managing master worker signals.
+  - `uvicorn.workers.UvicornWorker` runs high-performance async worker processes.
+  - Multi-core CPU utilization is achieved across Gunicorn worker processes (`-w 4`).
+  - SlowAPI middleware intercepts incoming requests to enforce IP-based rate limiting.
+  - WebSockets & SSE endpoints stream non-blocking I/O over standard ASGI protocol.
 ===============================================================================
 """
 
@@ -24,10 +20,13 @@ import logging
 from fastapi import FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
 from app.core.config import settings
 from app.core.lifespan import lifespan
-from app.api.routes import auth, documents, chat
+from app.core.rate_limit import limiter
+from app.api.routes import auth, documents, chat, websockets
 
 # Configure logger
 logger = logging.getLogger("research_pilot.main")
@@ -43,10 +42,14 @@ app = FastAPI(
 )
 
 # -----------------------------------------------------------------------------
+# Rate Limiter Configuration (SlowAPI)
+# -----------------------------------------------------------------------------
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# -----------------------------------------------------------------------------
 # CORS Middleware Configuration
 # -----------------------------------------------------------------------------
-# In Express: `app.use(cors({ origin: ['http://localhost:3000'], credentials: true }))`
-# In FastAPI: `CORSMiddleware` intercepts requests to handle preflight OPTIONS requests.
 if settings.BACKEND_CORS_ORIGINS:
     app.add_middleware(
         CORSMiddleware,
@@ -59,11 +62,10 @@ if settings.BACKEND_CORS_ORIGINS:
 # -----------------------------------------------------------------------------
 # Router Registrations
 # -----------------------------------------------------------------------------
-# In Express: `app.use('/api/v1/auth', authRouter)`
-# In FastAPI: `app.include_router(auth.router, prefix="/api/v1")`
 app.include_router(auth.router, prefix=settings.API_V1_STR)
 app.include_router(documents.router, prefix=settings.API_V1_STR)
 app.include_router(chat.router, prefix=settings.API_V1_STR)
+app.include_router(websockets.router, prefix=settings.API_V1_STR)
 
 
 # -----------------------------------------------------------------------------
@@ -99,7 +101,6 @@ async def health_check():
     )
 
 
-# Standard execution block when executing `python app/main.py` directly
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)

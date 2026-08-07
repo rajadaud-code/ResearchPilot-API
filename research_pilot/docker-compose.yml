@@ -1,0 +1,95 @@
+# ==============================================================================
+# ResearchPilot API - Multi-Container Docker Compose Stack
+# ==============================================================================
+# Runs:
+#   1. web (FastAPI application managed by Gunicorn/Uvicorn workers)
+#   2. postgres (PostgreSQL 16 Database)
+#   3. redis (Redis 7 Message Broker & Result Backend)
+#   4. celery_worker (Celery worker process scaling independently)
+# ==============================================================================
+
+version: '3.8'
+
+services:
+  # --- 1. FastAPI Web Application Service ---
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: research_pilot_web
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - DEBUG=false
+      - DATABASE_URL=postgresql+asyncpg://postgres:password@postgres:5432/research_pilot_db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - CHROMA_HOST=localhost
+      - CHROMA_PORT=8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # --- 2. PostgreSQL Database Service ---
+  postgres:
+    image: postgres:16-alpine
+    container_name: research_pilot_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: research_pilot_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- 3. Redis Message Broker & Result Backend ---
+  redis:
+    image: redis:7-alpine
+    container_name: research_pilot_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- 4. Celery Asynchronous Task Worker ---
+  # Scale worker instances: `docker compose up --scale celery_worker=3`
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: research_pilot_celery_worker
+    restart: always
+    command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=4
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql+asyncpg://postgres:password@postgres:5432/research_pilot_db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:

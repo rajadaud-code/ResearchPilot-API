@@ -1,14 +1,15 @@
 """
-Chat & Streaming API Routes with Authenticated Persistent Memory.
+Chat & Streaming API Routes with Authenticated Persistent Memory & Rate Limiting.
 
 ===============================================================================
-AUTHENTICATED SSE STREAMING & AUTOMATIC HISTORY PERSISTENCE
+AUTHENTICATED SSE STREAMING & RATE LIMIT SECURITY
 ===============================================================================
-1. Security:
-   - Endpoint protected by `current_user: User = Depends(get_current_user)`.
-   - Swagger UI automatically passes the JWT Bearer token when authorized.
+1. Rate Limiting Security:
+   - Endpoint protected by `@limiter.limit("10/minute")` using `slowapi`.
+   - Prevents API credit exhaustion attacks by restricting clients to 10 streaming requests/min.
 
-2. Persistent Memory Workflow:
+2. Security & Persistent Memory Workflow:
+   - Protected by `current_user: User = Depends(get_current_user)`.
    - User Query is saved to database (`role="user"`) *before* streaming begins.
    - Stream tokens are emitted real-time over SSE while accumulating in-memory.
    - Upon completion, full synthesized response is committed to PostgreSQL (`role="assistant"`).
@@ -24,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.agents.research_agent import stream_research_agent_response
 from app.api.dependencies import get_db, get_ai_model, get_current_user
+from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.chat_schema import ChatMessageResponse
 from app.services.ai_svc import ai_service
@@ -56,7 +58,6 @@ async def authenticated_event_generator(
     try:
         # Consume tokens from the autonomous agent generator
         async for token in stream_research_agent_response(query):
-            # Check client disconnect state
             if await request.is_disconnected():
                 logger.warning(f"⚠️ Client [User {user_id}] disconnected mid-stream. Cancelling execution.")
                 break
@@ -78,7 +79,6 @@ async def authenticated_event_generator(
             except Exception as e:
                 logger.error(f"❌ Failed to persist assistant response turn: {str(e)}")
 
-        # Signal completion with custom end event
         end_payload = json.dumps({"type": "end", "status": "completed"})
         yield f"event: end\ndata: {end_payload}\n\n"
 
@@ -91,12 +91,13 @@ async def authenticated_event_generator(
 @router.get(
     "/stream",
     response_class=StreamingResponse,
-    summary="Stream Protected AI Research Response via SSE",
+    summary="Stream Protected AI Research Response via SSE (Rate-Limited)",
     description=(
-        "Establishes an authenticated Server-Sent Events (SSE) connection that streams autonomous research tokens "
-        "and automatically saves conversational history turns to PostgreSQL."
+        "Establishes an authenticated Server-Sent Events (SSE) connection. "
+        "Rate-limited to 10 requests per minute per IP address."
     )
 )
+@limiter.limit("10/minute")
 async def stream_chat_response(
     request: Request,
     query: str = Query(..., min_length=1, description="Research question or query."),
@@ -106,7 +107,7 @@ async def stream_chat_response(
 ):
     """
     Protected HTTP GET endpoint delivering real-time SSE stream.
-    Requires Bearer JWT token authentication.
+    Rate limited to 10 requests/minute.
     """
     if not query.strip():
         raise HTTPException(

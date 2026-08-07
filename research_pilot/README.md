@@ -1,28 +1,32 @@
 # 🚀 ResearchPilot API — Autonomous Document Research Engine
 
-An enterprise-grade, asynchronous backend engine built with **FastAPI**, **SQLAlchemy 2.0 (Async)**, **JWT Auth**, **LangGraph Multi-Agent Orchestrator**, **ChromaDB**, **Celery + Redis Task Queue**, and **Server-Sent Events (SSE)**.
+An enterprise-grade, asynchronous backend engine built with **FastAPI**, **SQLAlchemy 2.0 (Async)**, **JWT Auth**, **SlowAPI Rate Limiting**, **LangGraph Multi-Agent Orchestrator**, **ChromaDB**, **Celery + Redis Task Queue**, **WebSockets**, **Gunicorn/Uvicorn Workers**, and **Docker Compose**.
 
 Designed specifically for AI Engineers and Node.js/Express developers transitioning to production Python backend development.
 
 ---
 
-## 🎯 Architecture Overview & Key Concepts
+## 🎯 Architecture Overview & Production Concepts
 
-### 1. LangGraph Multi-Agent StateGraph Orchestrator (Phase 5)
-- **AgentState**: Uses `Annotated[Sequence[BaseMessage], add_messages]` to automatically append chat turns and tool outputs to the state reducer.
-- **Custom Tools**: `@tool` decorated functions (`chroma_vector_search_tool`, `web_search_tool`) for retrieving document vector context and web facts.
-- **ToolNode**: Evaluates tool calls emitted by the agent node and appends `ToolMessage` instances back into the state graph.
-- **Conditional Edges**: `should_continue` dynamically routes execution between tool nodes and `END` based on LLM output.
-- **Token Streaming**: `stream_research_agent_response` streams execution node events and LLM tokens real-time over SSE.
+### 1. Gunicorn Process Management with Uvicorn ASGI Workers (Phase 7)
+Running Uvicorn alone limits execution to a single event-loop process.
+In production Docker containers:
+- **Gunicorn** acts as the process manager handling worker process lifecycles, graceful restarts, and OS signals (SIGTERM).
+- `uvicorn.workers.UvicornWorker` runs high-performance async Uvicorn worker instances.
+- Command: `gunicorn app.main:app -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000`.
 
-### 2. Asynchronous Document Ingestion with Celery & Redis (Phase 6)
-- **Non-blocking Upload**: `POST /api/v1/documents/upload` streams file bytes, dispatches a Celery task (`process_document_task.delay()`), and returns `202 Accepted` immediately.
-- **Worker Execution**: Dedicated Celery worker processes extract PDF text (`pypdf`), split text into semantic chunks (`RecursiveCharacterTextSplitter`), generate dense vector embeddings, and populate ChromaDB without blocking the FastAPI event loop.
-- **Task Status Polling**: `GET /api/v1/documents/tasks/{task_id}` queries Redis for ingestion progress (`PENDING`, `PROGRESS`, `SUCCESS`, `FAILURE`).
+### 2. API Security & Rate Limiting (`slowapi`)
+- Protected streaming endpoint (`GET /api/v1/chat/stream`) is decorated with `@limiter.limit("10/minute")`.
+- Prevents API credit drain attacks and denial-of-service attempts by returning HTTP 429 Too Many Requests when request quotas are exceeded.
+
+### 3. Real-Time WebSockets Progress Stream
+- Endpoint: `ws://localhost:8000/api/v1/ws/task-updates/{task_id}`.
+- ConnectionManager maintains active socket maps grouped by `task_id`.
+- Pushes Celery document chunking and vector indexing progress updates to the frontend in real time.
 
 ---
 
-## 📁 Directory Structure
+## 📁 Complete Directory Structure
 
 ```
 research_pilot/
@@ -32,12 +36,14 @@ research_pilot/
 │   │   ├── routes/              
 │   │   │   ├── auth.py              # User registration & JWT login endpoints
 │   │   │   ├── documents.py         # Asynchronous document upload & task status routes
-│   │   │   └── chat.py              # Authenticated SSE stream & history routes
+│   │   │   ├── chat.py              # Authenticated & rate-limited SSE stream route
+│   │   │   └── websockets.py        # Real-time WebSocket task progress route
 │   │   └── websockets/
-│   │       └── manager.py           # WebSocket connection manager
+│   │       └── manager.py           # Task-specific WebSocket connection manager
 │   ├── core/
 │   │   ├── config.py                # Pydantic v2 Settings (.env validation)
 │   │   ├── security.py              # bcrypt hashing & JWT encode/decode
+│   │   ├── rate_limit.py            # SlowAPI rate limiting configuration
 │   │   └── lifespan.py              # ASGI Lifespan (DB tables, ChromaDB & models)
 │   ├── ai/                      
 │   │   ├── agents/              
@@ -62,78 +68,58 @@ research_pilot/
 │   └── main.py                      # FastAPI app entry point & CORS
 ├── .env                             # Environment configuration
 ├── .env.example                     # Environment template
+├── Dockerfile                       # Multi-stage production Gunicorn/Uvicorn image
+├── docker-compose.yml               # Orchestration for web, postgres, redis, celery
 ├── requirements.txt                 # Project dependencies
 └── README.md                        # Project documentation
 ```
 
 ---
 
-## 🛠️ Step-by-Step Setup Guide
+## 🛠️ Step-by-Step Production Deployment Guide (Docker)
 
-### 1. Activate Virtual Environment & Install Dependencies
+### 1. Build and Launch full Multi-Container Stack
+Run the entire production stack (`web`, `postgres`, `redis`, `celery_worker`) using Docker Compose:
+
 ```bash
 cd research_pilot
-python -m venv venv
-.\venv\Scripts\Activate.ps1  # Windows PowerShell
-pip install -r requirements.txt
+docker compose up --build -d
 ```
 
-### 2. Start Redis & Celery Worker Process
-In a dedicated terminal window:
+### 2. Scale Celery Workers Independently
+Scale background worker processes up to handle heavy PDF ingestion queues:
+
 ```bash
-celery -A app.worker.celery_app worker --loglevel=info
+docker compose up -d --scale celery_worker=3
 ```
 
-### 3. Start FastAPI Uvicorn Server
+### 3. Check Container Health & Logs
 ```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+docker compose ps
+docker compose logs -f web
 ```
-
-- **Interactive API Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
 
 ---
 
-## 🧪 Testing Phase 5 & Phase 6 Endpoints
+## 🧪 Testing Phase 7 Features
 
-### 1. Register User & Obtain JWT Access Token
+### 1. Test Rate Limiting (HTTP 429)
+Send 11 rapid requests to `/api/v1/chat/stream`:
 ```bash
-# Register
-curl -X POST "http://localhost:8000/api/v1/auth/register" \
-     -H "Content-Type: application/json" \
-     -d '{"email": "researcher@example.com", "password": "SecurePassword123"}'
-
-# Login
-curl -X POST "http://localhost:8000/api/v1/auth/login" \
-     -H "Content-Type: application/x-www-form-urlencoded" \
-     -d "username=researcher@example.com&password=SecurePassword123"
+for i in {1..11}; do
+  curl -i -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+       "http://localhost:8000/api/v1/chat/stream?query=Test+query+$i"
+done
 ```
+*The 11th request will return `HTTP/1.1 429 Too Many Requests`.*
 
-### 2. Upload Document for Asynchronous Ingestion (HTTP 202 Accepted)
-```bash
-curl -X POST "http://localhost:8000/api/v1/documents/upload" \
-     -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
-     -F "file=@/path/to/sample_paper.pdf"
-```
+### 2. Test Real-Time Task Updates over WebSocket
+In JavaScript / Browser console:
+```javascript
+const taskId = "YOUR_CELERY_TASK_ID";
+const ws = new WebSocket(`ws://localhost:8000/api/v1/ws/task-updates/${taskId}`);
 
-Response:
-```json
-{
-  "status": "ACCEPTED",
-  "message": "File upload received. Document ingestion task dispatched to background worker queue.",
-  "document_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
-  "task_id": "f83a21d9-3e54-482a-a92c-e2f416551b9e",
-  "status_url": "/api/v1/documents/tasks/f83a21d9-3e54-482a-a92c-e2f416551b9e"
-}
-```
-
-### 3. Poll Background Task Ingestion Status
-```bash
-curl -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
-     "http://localhost:8000/api/v1/documents/tasks/f83a21d9-3e54-482a-a92c-e2f416551b9e"
-```
-
-### 4. Stream LangGraph Multi-Agent AI Research Tokens via SSE
-```bash
-curl -N -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
-     "http://localhost:8000/api/v1/chat/stream?query=Search+documents+for+quantum+architecture"
+ws.onopen = () => console.log("🟢 Connected to Task WebSocket Stream");
+ws.onmessage = (event) => console.log("📡 Progress Update:", JSON.parse(event.data));
+ws.onclose = () => console.log("🔴 Socket Closed");
 ```
