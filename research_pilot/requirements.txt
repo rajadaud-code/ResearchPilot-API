@@ -27,10 +27,14 @@ python-multipart>=0.0.9,<0.1.0
 # Vector Database Client
 chromadb>=0.5.0
 
-# AI Frameworks (LangChain & LangGraph for agent orchestration)
+# AI Frameworks (LangChain & LangGraph for multi-agent state graph orchestration)
 langchain>=0.2.0
 langchain-core>=0.2.0
+langchain-community>=0.2.0
 langgraph>=0.0.50
+
+# PDF & Document Processing
+pypdf>=4.2.0,<5.0.0
 
 # Asynchronous Task Queue & Cache (Celery & Redis replaces BullMQ / Bee-Queue in Node)
 celery>=5.4.0

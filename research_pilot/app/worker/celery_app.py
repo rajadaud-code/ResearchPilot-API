@@ -5,14 +5,13 @@ Celery Task Queue Application Initialization.
 EXPRESS / NODE.JS BULLMQ VS. PYTHON CELERY
 ===============================================================================
 In Node.js:
-  - Heavy background processing (e.g. video processing, PDF parsing) uses BullMQ or Bee-Queue backed by Redis.
-  - Workers run as separate Node processes consuming jobs from Redis queues.
+  - Background workers use BullMQ with Redis streams/queues to offload long-running tasks out of the HTTP thread.
 
 In Python:
-  - Celery is the standard distributed task queue framework in Python.
-  - Celery offloads CPU-heavy tasks (e.g. document embedding generation, OCR, fine-tuning) out of the
-    main async event loop into dedicated worker processes.
-  - Uses Redis or RabbitMQ as the message broker (`CELERY_BROKER_URL`).
+  - Celery is the industry standard distributed task queue for Python backend systems.
+  - Heavy tasks (such as PDF text extraction, OCR, vector embedding calculation) run in separate Celery
+    worker processes, leaving the FastAPI `asyncio` event loop responsive to incoming HTTP/SSE connections.
+  - State and results are persisted in the Redis backend (`CELERY_RESULT_BACKEND`).
 ===============================================================================
 """
 
@@ -33,4 +32,5 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     task_track_started=True,
+    result_expires=3600,  # Expire task results after 1 hour
 )

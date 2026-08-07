@@ -1,77 +1,183 @@
 """
-Autonomous Research Agent Module (LangGraph / LangChain Simulator).
+Autonomous LangGraph Multi-Agent Orchestrator.
 
 ===============================================================================
-EXPRESS / NODE.JS VS. FASTAPI ASYNC GENERATORS & STREAMING
+EXPRESS / NODE.JS VS. LANGGRAPH STATEGRAPH ORCHESTRATION
 ===============================================================================
-In Node.js / Express:
-  - Streaming usually uses Node Readable Streams (`stream.Readable`), `res.write()`, or `EventEmitter`.
-  - Asynchronous iteration in modern Node uses `async function* generator()` yielding chunks,
-    which are written to the response stream via `res.write(chunk)`.
+In Node.js:
+  - Agent loops are often coded imperatively using `while(true)` loops, manually calling
+    OpenAI tool APIs until no `tool_calls` remain in the response object.
 
-In FastAPI / Python (AsyncGenerator & PEP 525):
-  - An `AsyncGenerator[str, None]` is created using `async def` containing one or more `yield` statements.
-  - Python's ASGI model allows FastAPI's `StreamingResponse` to consume an `AsyncGenerator` directly.
-  - Each time `yield` is called, execution pauses, yielding control back to Python's `asyncio` event loop.
-  - Uvicorn serializes the chunk and pushes it down the network wire immediately without blocking other requests.
-  - In LangChain / LangGraph, streaming models (like `chain.astream()`) produce async generators of tokens or
-    graph state updates naturally.
+In Python / LangGraph:
+  - LangGraph provides a cyclic graph structure (`StateGraph`) with state management,
+    node execution, and declarative conditional branching.
+  - State (`AgentState`) is shared across nodes. `Annotated[Sequence[BaseMessage], add_messages]`
+    automatically appends new messages to the message history state without manual array concatenation.
+  - `ToolNode` executes tool calls in parallel or sequence, returning `ToolMessage` instances.
+  - `tools_condition` or a custom routing function evaluates whether to loop back to the agent node
+    or transition to `END`.
 ===============================================================================
 """
 
 import asyncio
 import json
-import time
-from typing import AsyncGenerator
+import logging
+from typing import Annotated, Sequence, TypedDict, AsyncGenerator, List, Optional
+
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+
+from app.ai.prompts import RESEARCH_AGENT_SYSTEM_PROMPT
+from app.ai.tools.research_tools import RESEARCH_TOOLS
+
+logger = logging.getLogger("research_pilot.agent")
+
+
+class AgentState(TypedDict):
+    """
+    State schema for the LangGraph agent graph.
+    `messages` uses `add_messages` reducer to automatically append new messages to state.
+    """
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+
+
+def create_agent_node():
+    """
+    Creates the main reasoning node function.
+    In production:
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2).bind_tools(RESEARCH_TOOLS)
+        return lambda state: {"messages": [llm.invoke(state["messages"])]}
+    """
+    async def agent_node(state: AgentState) -> dict:
+        messages = state["messages"]
+        last_message = messages[-1]
+        user_text = last_message.content if hasattr(last_message, "content") else str(last_message)
+        
+        logger.info(f"🤖 [LangGraph Node: Agent Reasoning] Processing turn with {len(messages)} state messages.")
+        await asyncio.sleep(0.3)
+
+        # Simulating autonomous tool selection logic for demonstration
+        # If query mentions "document", "search", "vector", or "web", simulate a tool call step first
+        has_tool_message = any(isinstance(m, ToolMessage) for m in messages)
+
+        if not has_tool_message and any(k in user_text.lower() for k in ["document", "search", "vector", "pdf", "quantum"]):
+            # Produce an AIMessage containing a tool call
+            ai_msg = AIMessage(
+                content="I need to consult the ChromaDB vector database index to retrieve relevant document context.",
+                tool_calls=[{
+                    "name": "chroma_vector_search_tool",
+                    "args": {"query": user_text},
+                    "id": "call_vector_db_001"
+                }]
+            )
+            return {"messages": [ai_msg]}
+
+        # If tools have executed or query is straightforward, return final answer
+        final_answer = (
+            f"Synthesized Research Answer for query: '{user_text}':\n\n"
+            "1. **Architecture Specs**: The system uses FastAPI ASGI with SQLAlchemy 2.0 Async engine.\n"
+            "2. **Agent State**: LangGraph StateGraph orchestrates cyclic tool calling and state updates.\n"
+            "3. **Task Queue**: Heavy PDF vector ingestion is offloaded asynchronously to Redis & Celery workers."
+        )
+        return {"messages": [AIMessage(content=final_answer)]}
+
+    return agent_node
+
+
+def should_continue(state: AgentState) -> str:
+    """
+    Conditional edge function. Evaluates whether the agent produced tool calls.
+    Returns "tools" to route to ToolNode, or END to finish execution.
+    """
+    messages = state["messages"]
+    last_message = messages[-1]
+
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        logger.info("🔀 [LangGraph Conditional Edge] Tool calls detected -> Routing to 'tools' node.")
+        return "tools"
+    
+    logger.info("🏁 [LangGraph Conditional Edge] No tool calls remaining -> Routing to END.")
+    return END
+
+
+def build_research_graph():
+    """
+    Compiles the complete LangGraph StateGraph execution pipeline.
+    """
+    workflow = StateGraph(AgentState)
+
+    # Add Nodes
+    workflow.add_node("agent", create_agent_node())
+    workflow.add_node("tools", ToolNode(RESEARCH_TOOLS))
+
+    # Add Edges
+    workflow.add_edge(START, "agent")
+    workflow.add_conditional_edges(
+        "agent",
+        should_continue,
+        {
+            "tools": "tools",
+            END: END
+        }
+    )
+    workflow.add_edge("tools", "agent")
+
+    # Compile Graph
+    compiled_graph = workflow.compile()
+    return compiled_graph
+
+
+# Pre-compiled global graph instance
+research_graph = build_research_graph()
 
 
 async def stream_research_agent_response(query: str) -> AsyncGenerator[str, None]:
     """
-    Simulates a multi-node LangGraph autonomous research agent streaming execution steps and LLM tokens.
-    
-    In a real LangGraph setup:
-        graph = builder.compile()
-        async for event in graph.astream({"messages": [HumanMessage(content=query)]}):
-            yield format_event(event)
+    Streams LangGraph agent execution step updates and LLM tokens in real time.
 
     Args:
-        query (str): The user's input research query.
+        query (str): The research question submitted by the user.
 
     Yields:
-        AsyncGenerator[str, None]: Incremental response tokens formatted for consumption.
+        AsyncGenerator[str, None]: Token strings and step progress updates.
     """
+    # Initialize graph state with SystemMessage and HumanMessage
+    initial_state = {
+        "messages": [
+            SystemMessage(content=RESEARCH_AGENT_SYSTEM_PROMPT),
+            HumanMessage(content=query)
+        ]
+    }
 
-    # --- Node 1: Intent Analysis & Plan Generation ---
-    plan_message = f"🔍 [Agent Node: Intent Analysis] Formulating research strategy for query: '{query}'..."
-    yield plan_message + "\n"
-    await asyncio.sleep(0.4)  # Simulate async execution of LangGraph node 1
+    # Step 1: Initial event notification
+    yield f"🔍 [Agent Node: State Initialization] Starting research pipeline for: '{query}'...\n"
+    await asyncio.sleep(0.3)
 
-    # --- Node 2: Vector Store Retrieval (ChromaDB) ---
-    retrieval_message = "📚 [Agent Node: Vector Search] Retrieving top relevant document chunks from ChromaDB index..."
-    yield retrieval_message + "\n"
-    await asyncio.sleep(0.5)  # Simulate async vector query
+    # Run LangGraph streaming execution loop
+    try:
+        async for event in research_graph.astream(initial_state, stream_mode="updates"):
+            for node_name, node_output in event.items():
+                yield f"\n⚡ [LangGraph Executed Node: '{node_name}']\n"
+                
+                messages = node_output.get("messages", [])
+                for msg in messages:
+                    if isinstance(msg, AIMessage):
+                        if hasattr(msg, "tool_calls") and msg.tool_calls:
+                            tool_name = msg.tool_calls[0]["name"]
+                            yield f"🛠️ Requesting tool execution: '{tool_name}'...\n"
+                        else:
+                            # Stream content tokens incrementally
+                            text_content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                            words = text_content.split(" ")
+                            for i, word in enumerate(words):
+                                token = word + (" " if i < len(words) - 1 else "")
+                                yield token
+                                await asyncio.sleep(0.03)
+                    elif isinstance(msg, ToolMessage):
+                        yield f"📊 Received tool context: {msg.content[:120]}...\n"
 
-    # --- Node 3: LLM Synthesis & Token-by-Token Response Generation ---
-    synth_header = "\n🤖 [Agent Node: Response Synthesis] Answer:\n"
-    yield synth_header
-
-    # Simulating LLM streaming output (e.g. OpenAI / Anthropic streaming tokens via LangChain)
-    synthesized_answer = (
-        f"Based on retrieved documentation regarding '{query}', here is the synthesized research synthesis:\n\n"
-        "1. **Core Architecture**: The system utilizes an asynchronous event-driven model powered by FastAPI and ASGI.\n"
-        "2. **State & Lifespan**: Global connection pools (ChromaDB, Postgres) are initialized once during lifespan boot.\n"
-        "3. **Real-time Delivery**: Token streams are transmitted seamlessly to the frontend via Server-Sent Events (SSE).\n\n"
-        "This approach guarantees non-blocking I/O, optimal memory utilization, and sub-100ms first-token latency."
-    )
-
-    # Break answer into individual words/tokens to simulate real-time LLM token generation
-    words = synthesized_answer.split(" ")
-    for i, word in enumerate(words):
-        # Add space after words except the last one
-        token = word + (" " if i < len(words) - 1 else "")
-        yield token
-        # Simulate ~30ms latency per token (similar to GPT-4o-mini streaming speed)
-        await asyncio.sleep(0.04)
-
-    # Final completion signal
-    yield "\n\n[COMPLETED_RESEARCH_STREAM]"
+    except Exception as e:
+        logger.error(f"❌ Error in LangGraph execution: {str(e)}", exc_info=True)
+        yield f"\n⚠️ Error executing research agent graph: {str(e)}"

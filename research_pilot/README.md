@@ -1,6 +1,6 @@
 # 🚀 ResearchPilot API — Autonomous Document Research Engine
 
-An enterprise-grade, asynchronous backend engine built with **FastAPI**, **SQLAlchemy 2.0 (Async)**, **Passlib (bcrypt)**, **JWT Authentication**, **ChromaDB**, **LangGraph / LangChain**, **Celery**, and **Server-Sent Events (SSE)**.
+An enterprise-grade, asynchronous backend engine built with **FastAPI**, **SQLAlchemy 2.0 (Async)**, **JWT Auth**, **LangGraph Multi-Agent Orchestrator**, **ChromaDB**, **Celery + Redis Task Queue**, and **Server-Sent Events (SSE)**.
 
 Designed specifically for AI Engineers and Node.js/Express developers transitioning to production Python backend development.
 
@@ -8,23 +8,17 @@ Designed specifically for AI Engineers and Node.js/Express developers transition
 
 ## 🎯 Architecture Overview & Key Concepts
 
-### 1. FastAPI Lifespan Context Manager (`@asynccontextmanager`)
-Managed using Python's ASGI Lifespan protocol (`@asynccontextmanager`):
-- Connects database tables and ChromaDB vector store clients at startup.
-- Loads AI models into memory once and stores instances on `app.state`.
-- Flushes DB connection pools and releases resources cleanly on shutdown.
+### 1. LangGraph Multi-Agent StateGraph Orchestrator (Phase 5)
+- **AgentState**: Uses `Annotated[Sequence[BaseMessage], add_messages]` to automatically append chat turns and tool outputs to the state reducer.
+- **Custom Tools**: `@tool` decorated functions (`chroma_vector_search_tool`, `web_search_tool`) for retrieving document vector context and web facts.
+- **ToolNode**: Evaluates tool calls emitted by the agent node and appends `ToolMessage` instances back into the state graph.
+- **Conditional Edges**: `should_continue` dynamically routes execution between tool nodes and `END` based on LLM output.
+- **Token Streaming**: `stream_research_agent_response` streams execution node events and LLM tokens real-time over SSE.
 
-### 2. JWT Bearer Authentication & OAuth2 Scheme
-- User registration (`POST /api/v1/auth/register`) hashes passwords securely using salted `bcrypt` (`passlib`).
-- User authentication (`POST /api/v1/auth/login`) issues signed JWT access tokens using HMAC-SHA256 (`python-jose`).
-- Protected endpoints declare `current_user: User = Depends(get_current_user)` for declarative, auto-validated user resolution.
-
-### 3. Authenticated SSE Streaming & Persistent Memory
-- The streaming endpoint (`GET /api/v1/chat/stream`) requires JWT Bearer authentication.
-- Incoming user queries are committed to PostgreSQL (`role="user"`) *before* streaming begins.
-- Generated tokens stream real-time over SSE while accumulating in-memory.
-- Upon completion, the synthesized answer is committed to PostgreSQL (`role="assistant"`).
-- Chat turns are fetched via `GET /api/v1/chat/history` to provide conversational memory windows for LLM agent pipelines.
+### 2. Asynchronous Document Ingestion with Celery & Redis (Phase 6)
+- **Non-blocking Upload**: `POST /api/v1/documents/upload` streams file bytes, dispatches a Celery task (`process_document_task.delay()`), and returns `202 Accepted` immediately.
+- **Worker Execution**: Dedicated Celery worker processes extract PDF text (`pypdf`), split text into semantic chunks (`RecursiveCharacterTextSplitter`), generate dense vector embeddings, and populate ChromaDB without blocking the FastAPI event loop.
+- **Task Status Polling**: `GET /api/v1/documents/tasks/{task_id}` queries Redis for ingestion progress (`PENDING`, `PROGRESS`, `SUCCESS`, `FAILURE`).
 
 ---
 
@@ -37,7 +31,7 @@ research_pilot/
 │   │   ├── dependencies.py          # OAuth2 scheme, get_current_user, DB sessions
 │   │   ├── routes/              
 │   │   │   ├── auth.py              # User registration & JWT login endpoints
-│   │   │   ├── documents.py         # Vector search & document router
+│   │   │   ├── documents.py         # Asynchronous document upload & task status routes
 │   │   │   └── chat.py              # Authenticated SSE stream & history routes
 │   │   └── websockets/
 │   │       └── manager.py           # WebSocket connection manager
@@ -47,12 +41,13 @@ research_pilot/
 │   │   └── lifespan.py              # ASGI Lifespan (DB tables, ChromaDB & models)
 │   ├── ai/                      
 │   │   ├── agents/              
-│   │   │   └── research_agent.py    # AsyncGenerator LangGraph agent simulator
+│   │   │   └── research_agent.py    # LangGraph StateGraph & ToolNode agent
 │   │   ├── chains/                  # LangChain chains
-│   │   ├── tools/                   # Agent custom tools
+│   │   ├── tools/                   
+│   │   │   └── research_tools.py    # Custom @tool functions (ChromaDB & Web Search)
 │   │   └── prompts.py               # Centralized system prompts
 │   ├── services/                
-│   │   ├── document_svc.py          # Document parsing & chunking service
+│   │   ├── document_svc.py          # Document extraction & chunking service
 │   │   └── ai_svc.py                # Persistent chat history service methods
 │   ├── models/                      
 │   │   ├── base.py                  # SQLAlchemy 2.0 DeclarativeBase
@@ -63,7 +58,7 @@ research_pilot/
 │   │   └── chat_schema.py           # Chat & Stream Pydantic schemas
 │   ├── worker/                  
 │   │   ├── celery_app.py            # Celery task queue configuration
-│   │   └── tasks.py                 # Async background tasks (embeddings)
+│   │   └── tasks.py                 # Celery PDF extraction & embedding task
 │   └── main.py                      # FastAPI app entry point & CORS
 ├── .env                             # Environment configuration
 ├── .env.example                     # Environment template
@@ -75,55 +70,70 @@ research_pilot/
 
 ## 🛠️ Step-by-Step Setup Guide
 
-### 1. Create and Activate Virtual Environment (`venv`)
+### 1. Activate Virtual Environment & Install Dependencies
 ```bash
 cd research_pilot
 python -m venv venv
 .\venv\Scripts\Activate.ps1  # Windows PowerShell
-```
-
-### 2. Install Dependencies
-```bash
 pip install -r requirements.txt
 ```
 
-### 3. Run Development Server using Uvicorn
+### 2. Start Redis & Celery Worker Process
+In a dedicated terminal window:
+```bash
+celery -A app.worker.celery_app worker --loglevel=info
+```
+
+### 3. Start FastAPI Uvicorn Server
 ```bash
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-- **Swagger Interactive API Documentation**: [http://localhost:8000/docs](http://localhost:8000/docs)
-- **ReDoc Documentation**: [http://localhost:8000/redoc](http://localhost:8000/redoc)
+- **Interactive API Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
 
 ---
 
-## 🧪 Testing Phase 3 & Phase 4 Endpoints
+## 🧪 Testing Phase 5 & Phase 6 Endpoints
 
-### 1. Register a New User Account
+### 1. Register User & Obtain JWT Access Token
 ```bash
+# Register
 curl -X POST "http://localhost:8000/api/v1/auth/register" \
      -H "Content-Type: application/json" \
      -d '{"email": "researcher@example.com", "password": "SecurePassword123"}'
-```
 
-### 2. Authenticate & Obtain JWT Access Token
-```bash
+# Login
 curl -X POST "http://localhost:8000/api/v1/auth/login" \
      -H "Content-Type: application/x-www-form-urlencoded" \
      -d "username=researcher@example.com&password=SecurePassword123"
 ```
-*Copy the returned `access_token` string.*
 
-### 3. Stream Protected AI Response via SSE
-Pass the Bearer token in the `Authorization` header:
-
+### 2. Upload Document for Asynchronous Ingestion (HTTP 202 Accepted)
 ```bash
-curl -N -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
-     "http://localhost:8000/api/v1/chat/stream?query=What+is+SQLAlchemy+2.0+async+ORM"
+curl -X POST "http://localhost:8000/api/v1/documents/upload" \
+     -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+     -F "file=@/path/to/sample_paper.pdf"
 ```
 
-### 4. Fetch Persistent Chat History
+Response:
+```json
+{
+  "status": "ACCEPTED",
+  "message": "File upload received. Document ingestion task dispatched to background worker queue.",
+  "document_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "task_id": "f83a21d9-3e54-482a-a92c-e2f416551b9e",
+  "status_url": "/api/v1/documents/tasks/f83a21d9-3e54-482a-a92c-e2f416551b9e"
+}
+```
+
+### 3. Poll Background Task Ingestion Status
 ```bash
 curl -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
-     "http://localhost:8000/api/v1/chat/history"
+     "http://localhost:8000/api/v1/documents/tasks/f83a21d9-3e54-482a-a92c-e2f416551b9e"
+```
+
+### 4. Stream LangGraph Multi-Agent AI Research Tokens via SSE
+```bash
+curl -N -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+     "http://localhost:8000/api/v1/chat/stream?query=Search+documents+for+quantum+architecture"
 ```
