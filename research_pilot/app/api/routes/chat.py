@@ -1,81 +1,89 @@
 """
-Chat & Streaming API Routes.
+Chat & Streaming API Routes with Authenticated Persistent Memory.
 
 ===============================================================================
-EXPRESS / NODE.JS VS. FASTAPI SSE (SERVER-SENT EVENTS) STREAMING
+AUTHENTICATED SSE STREAMING & AUTOMATIC HISTORY PERSISTENCE
 ===============================================================================
-In Node.js / Express:
-  - SSE requires manually writing response headers:
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
-      });
-  - Chunks are manually written with `res.write(`data: ${JSON.stringify(chunk)}\n\n`)`.
-  - Disconnect handling requires subscribing to `req.on('close', ...)` event listeners.
+1. Security:
+   - Endpoint protected by `current_user: User = Depends(get_current_user)`.
+   - Swagger UI automatically passes the JWT Bearer token when authorized.
 
-In FastAPI / Python (StreamingResponse + Async Generator):
-  - `starlette.responses.StreamingResponse` accepts any Python `AsyncGenerator`.
-  - FastAPI handles reading from the async generator and flushing data to the ASGI socket automatically.
-  - SSE Protocol Requirements:
-      1. Content-Type must be `text/event-stream`.
-      2. Chunks MUST be prefixed with `data: ` and end with double newlines `\n\n`.
-      3. `Cache-Control: no-cache` prevents proxy caching.
-      4. `X-Accel-Buffering: no` prevents Nginx / reverse proxies from buffering tokens.
-  - Client Disconnect Detection:
-      Inside the async generator loop, calling `await request.is_disconnected()` returns `True` if the
-      client closed the connection, allowing immediate cancellation of expensive LLM tasks.
+2. Persistent Memory Workflow:
+   - User Query is saved to database (`role="user"`) *before* streaming begins.
+   - Stream tokens are emitted real-time over SSE while accumulating in-memory.
+   - Upon completion, full synthesized response is committed to PostgreSQL (`role="assistant"`).
 ===============================================================================
 """
 
 import json
 import logging
-from typing import AsyncGenerator
+from typing import List, AsyncGenerator
 from fastapi import APIRouter, Depends, Query, Request, HTTPException, status
 from fastapi.responses import StreamingResponse
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.agents.research_agent import stream_research_agent_response
-from app.api.dependencies import get_ai_model
+from app.api.dependencies import get_db, get_ai_model, get_current_user
+from app.models.user import User
+from app.schemas.chat_schema import ChatMessageResponse
+from app.services.ai_svc import ai_service
 
 logger = logging.getLogger("research_pilot.chat")
 
 router = APIRouter(prefix="/chat", tags=["Chat & AI Streaming"])
 
 
-async def event_generator(request: Request, query: str) -> AsyncGenerator[str, None]:
+async def authenticated_event_generator(
+    request: Request,
+    query: str,
+    user_id: int,
+    db: AsyncSession
+) -> AsyncGenerator[str, None]:
     """
-    Formatter generator wrapping the research agent async stream into W3C compliant SSE format.
-    
-    SSE Specification Format:
-        data: <payload>\n\n
-        
-    If an event name or id is included:
-        event: message\n
-        id: 123\n
-        data: <payload>\n\n
+    SSE Generator for authenticated users.
+    Persists user query, streams tokens real-time, and commits assistant response upon completion.
     """
-    logger.info(f"📡 Initiating SSE stream for query: '{query}'")
+    logger.info(f"📡 Initiating authenticated SSE stream [User ID: {user_id}] for query: '{query}'")
+
+    # 1. Save user query to database
+    try:
+        await ai_service.save_chat_message(db=db, user_id=user_id, role="user", content=query)
+    except Exception as e:
+        logger.error(f"❌ Failed to persist initial user query message: {str(e)}")
+
+    accumulated_tokens: List[str] = []
 
     try:
-        # Consume tokens from the autonomous agent async generator
+        # Consume tokens from the autonomous agent generator
         async for token in stream_research_agent_response(query):
-            # Check if the client terminated the HTTP connection (e.g. browser tab closed)
+            # Check client disconnect state
             if await request.is_disconnected():
-                logger.warning("⚠️ Client disconnected mid-stream. Halting AI execution pipeline.")
+                logger.warning(f"⚠️ Client [User {user_id}] disconnected mid-stream. Cancelling execution.")
                 break
 
-            # Escape single newlines inside payload to preserve SSE line framing
+            accumulated_tokens.append(token)
             payload = json.dumps({"token": token, "type": "content"})
-            
-            # Yield properly formatted SSE line
             yield f"data: {payload}\n\n"
 
-        # Signal completion with a custom SSE end event
+        # 2. Persist complete assistant answer upon successful stream completion
+        full_assistant_reply = "".join(accumulated_tokens).strip()
+        if full_assistant_reply:
+            try:
+                await ai_service.save_chat_message(
+                    db=db,
+                    user_id=user_id,
+                    role="assistant",
+                    content=full_assistant_reply
+                )
+            except Exception as e:
+                logger.error(f"❌ Failed to persist assistant response turn: {str(e)}")
+
+        # Signal completion with custom end event
         end_payload = json.dumps({"type": "end", "status": "completed"})
         yield f"event: end\ndata: {end_payload}\n\n"
 
     except Exception as e:
-        logger.error(f"❌ Error during SSE streaming: {str(e)}", exc_info=True)
+        logger.error(f"❌ Streaming error for user {user_id}: {str(e)}", exc_info=True)
         error_payload = json.dumps({"type": "error", "message": "Internal streaming error occurred."})
         yield f"event: error\ndata: {error_payload}\n\n"
 
@@ -83,24 +91,22 @@ async def event_generator(request: Request, query: str) -> AsyncGenerator[str, N
 @router.get(
     "/stream",
     response_class=StreamingResponse,
-    summary="Stream AI Research Agent Response via SSE",
+    summary="Stream Protected AI Research Response via SSE",
     description=(
-        "Establishes a Server-Sent Events (SSE) connection that streams autonomous document research tokens "
-        "and agent reasoning steps in real-time."
+        "Establishes an authenticated Server-Sent Events (SSE) connection that streams autonomous research tokens "
+        "and automatically saves conversational history turns to PostgreSQL."
     )
 )
 async def stream_chat_response(
     request: Request,
-    query: str = Query(..., min_length=1, description="The research question or search query."),
+    query: str = Query(..., min_length=1, description="Research question or query."),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
     ai_model=Depends(get_ai_model),
 ):
     """
-    HTTP GET endpoint delivering real-time SSE stream.
-    
-    Demonstrates:
-      1. Query param validation via Pydantic (`Query(...)`).
-      2. Dependency Injection (`Depends(get_ai_model)`).
-      3. Returning `StreamingResponse` configured with `text/event-stream`.
+    Protected HTTP GET endpoint delivering real-time SSE stream.
+    Requires Bearer JWT token authentication.
     """
     if not query.strip():
         raise HTTPException(
@@ -108,14 +114,31 @@ async def stream_chat_response(
             detail="Query parameter cannot be empty."
         )
 
-    # Return StreamingResponse with SSE headers
     return StreamingResponse(
-        event_generator(request, query),
+        authenticated_event_generator(request, query, current_user.id, db),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # Disable Nginx response buffering for sub-100ms delivery
+            "X-Accel-Buffering": "no",
             "Content-Type": "text/event-stream",
         }
     )
+
+
+@router.get(
+    "/history",
+    response_model=List[ChatMessageResponse],
+    summary="Get User Chat History",
+    description="Retrieves the persistent conversation history turns stored in PostgreSQL for the authenticated user."
+)
+async def get_chat_history(
+    limit: int = Query(50, ge=1, le=200, description="Max history messages to fetch."),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Retrieves chronological chat history turns for current user.
+    """
+    messages = await ai_service.get_user_chat_history(db=db, user_id=current_user.id, limit=limit)
+    return messages

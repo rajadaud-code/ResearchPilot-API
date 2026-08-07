@@ -2,33 +2,33 @@
 FastAPI Dependency Injection Module.
 
 ===============================================================================
-EXPRESS / NODE.JS VS. FASTAPI DEPENDENCY INJECTION (Depends())
+EXPRESS / NODE.JS VS. FASTAPI AUTHENTICATION DEPENDENCIES
 ===============================================================================
 In Node.js / Express:
-  - Request contextual objects (DB clients, auth tokens, current user) are manually attached to `req`:
-      app.use((req, res, next) => { req.db = dbPool; next(); });
-  - Sub-functions rely on parameters passed down manually from controller functions.
-  - Resource cleanup (closing DB sessions or transaction rollbacks) must be done imperatively inside
-    `try/catch/finally` blocks inside every route handler or custom wrapper.
+  - Auth middleware parses `req.headers.authorization`, verifies token, and attaches `req.user = user`.
+  - Protected routes must explicitly include middleware in route definitions:
+      router.get('/protected', authMiddleware, handler);
 
-In FastAPI (`Depends()` architecture):
-  - Dependencies are declared declaratively in route parameter lists:
-      async def my_route(db: AsyncSession = Depends(get_db)):
-  - FastAPI executes dependencies *before* the route runs, resolving entire dependency trees automatically.
-  - Generator dependencies using `yield` allow setup logic BEFORE `yield` and teardown logic AFTER `yield`.
-    FastAPI guarantees teardown code runs AFTER the response is returned to the client (or if an exception occurs).
-  - Promotes modular, easily testable design—dependencies can be overridden in unit tests (`app.dependency_overrides`).
+In FastAPI (`OAuth2PasswordBearer` + `Depends(get_current_user)`):
+  - `OAuth2PasswordBearer` extracts Bearer tokens automatically from the Authorization header
+    and populates interactive Swagger UI `/docs` with an "Authorize" lock button.
+  - Route handlers simply add `current_user: User = Depends(get_current_user)` to parameter signatures.
+  - FastAPI handles dependency resolution, token extraction, database user lookup, error handling,
+    and automatic injection of the `User` ORM instance.
 ===============================================================================
 """
 
 from typing import AsyncGenerator
-from fastapi import Request, HTTPException, status
+from fastapi import Request, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
 from app.core.config import settings
+from app.core.security import decode_access_token
+from app.models.user import User
 
 # Create SQLAlchemy 2.0 Async Engine using asyncpg driver
-# In Express, this is comparable to initializing a pg `Pool` singleton.
 async_engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,
@@ -45,34 +45,32 @@ AsyncSessionLocal = async_sessionmaker(
     autoflush=False,
 )
 
+# OAuth2 Password Bearer scheme pointing to the login token URL
+# In Swagger UI (/docs), this unlocks the "Authorize" button for testing JWT protected routes
+oauth2_scheme = OAuth2PasswordBearer(
+    tokenUrl=f"{settings.API_V1_STR}/auth/login"
+)
+
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """
     Dependency generator for acquiring an asynchronous database session.
     Yields an `AsyncSession` for the duration of the HTTP request and handles cleanup automatically.
-    
-    Yields:
-        AsyncSession: Active SQLAlchemy async session.
     """
     async with AsyncSessionLocal() as session:
         try:
-            # Yield session to the route handler / dependency subscriber
             yield session
-            # Auto-commit on clean completion if needed by business logic
             await session.commit()
         except Exception:
-            # Rollback transaction on exception
             await session.rollback()
             raise
         finally:
-            # Session is closed automatically when exiting `async with` context
             await session.close()
 
 
 async def get_vector_db(request: Request):
     """
     Dependency function to retrieve the global ChromaDB client from `app.state`.
-    Demonstrates how request handlers safely access lifespan-initialized application state.
     """
     vector_db = getattr(request.app.state, "vector_db", None)
     if vector_db is None:
@@ -94,3 +92,53 @@ async def get_ai_model(request: Request):
             detail="AI research model service is not initialized."
         )
     return ai_model
+
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """
+    Dependency to validate JWT access token and retrieve the current authenticated user from database.
+    
+    Args:
+        token (str): JWT Bearer token extracted automatically by `OAuth2PasswordBearer`.
+        db (AsyncSession): Request-scoped database session.
+
+    Returns:
+        User: Authenticated SQLAlchemy User model instance.
+
+    Raises:
+        HTTPException: HTTP 401 Unauthorized if token is invalid or user does not exist.
+    """
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials or token expired.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    # Decode and verify JWT token payload signature
+    payload = decode_access_token(token)
+    if payload is None:
+        raise credentials_exception
+
+    # Extract user subject claim (email)
+    email: str = payload.get("sub")
+    if email is None:
+        raise credentials_exception
+
+    # Query database asynchronously for active user
+    stmt = select(User).where(User.email == email)
+    result = await db.execute(stmt)
+    user = result.scalar_one_or_none()
+
+    if user is None:
+        raise credentials_exception
+    
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Inactive user account."
+        )
+
+    return user

@@ -8,15 +8,12 @@ In Node.js / Express:
   - Application setup typically occurs top-to-bottom in index.js before `app.listen()`.
   - Database client connection pools, Redis clients, and background listeners are initialized globally
     or attached manually to express app state (`app.set('db', db)`).
-  - Graceful shutdown requires manual process signal handling (`process.on('SIGTERM', ...)`), closing server
-    listeners, draining DB pools, and terminating open sockets manually.
 
 In FastAPI (ASGI Lifespan standard using @asynccontextmanager):
   - Lifespan context managers replace older event hooks (`@app.on_event("startup")` / `"shutdown"`).
-  - Code BEFORE the `yield` runs when the server boots up (allocating state like DB pools, vector stores, AI weights).
+  - Code BEFORE `yield` runs when server boots (allocating state like DB tables, vector stores, AI weights).
   - Global state is stored cleanly on `app.state` (accessible to requests via FastAPI `Request.app.state`).
-  - Code AFTER the `yield` executes automatically when the server shuts down (freeing GPU memory, closing DB connections).
-  - Ensures atomic, fail-safe lifecycle handling natively supported by ASGI servers like Uvicorn.
+  - Code AFTER `yield` executes automatically when server shuts down.
 ===============================================================================
 """
 
@@ -24,6 +21,9 @@ from contextlib import asynccontextmanager
 import logging
 from typing import AsyncGenerator, Any, Dict
 from fastapi import FastAPI
+
+from app.api.dependencies import async_engine
+from app.models.base import Base
 
 # Setup logger for startup and shutdown feedback
 logger = logging.getLogger("research_pilot.lifespan")
@@ -33,7 +33,6 @@ logging.basicConfig(level=logging.INFO)
 class MockChromaDBClient:
     """
     Mock Vector Store client simulating a connection to ChromaDB.
-    Demonstrates how expensive connections are initialized once during lifespan startup.
     """
     def __init__(self, host: str, port: int):
         self.host = host
@@ -79,12 +78,18 @@ class MockAIModel:
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """
     FastAPI Lifespan context manager.
-    Handles startup resources (Vector DB, LLM models, Database pools) and ensures clean teardown.
+    Handles startup resources (Database tables, Vector DB, LLM models) and ensures clean teardown.
     """
-    # -------------------------------------------------------------------------
-    # 1. STARTUP PHASE (Executed before the application starts accepting requests)
-    # -------------------------------------------------------------------------
+    # 1. STARTUP PHASE
     logger.info("🚀 [Startup] Initializing ResearchPilot API services & global state...")
+
+    # Attempt database table creation using SQLAlchemy 2.0 async engine
+    try:
+        async with async_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("🗄️ [Database] Synchronized ORM tables (users, chat_messages).")
+    except Exception as e:
+        logger.warning(f"⚠️ [Database] Connection warning on startup table sync: {str(e)}")
 
     # Initialize ChromaDB Vector Database Client connection
     chroma_client = MockChromaDBClient(host="localhost", port=8000)
@@ -94,24 +99,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     ai_model = MockAIModel(model_name="gpt-4o-mini-researcher")
     await ai_model.load_weights()
 
-    # Attach initialized global state objects to `app.state`.
-    # FastAPI exposes `app.state` to all route handlers via Dependency Injection (`Request.app.state`).
+    # Attach initialized global state objects to `app.state`
     app.state.vector_db = chroma_client
     app.state.ai_model = ai_model
 
     logger.info("✅ [Startup] Global application state initialized successfully.")
 
-    # -------------------------------------------------------------------------
-    # 2. YIELD CONTROL (Application is active and serving HTTP/SSE/WebSocket traffic)
-    # -------------------------------------------------------------------------
+    # 2. YIELD CONTROL
     yield
 
-    # -------------------------------------------------------------------------
-    # 3. SHUTDOWN PHASE (Executed when Uvicorn receives SIGTERM/SIGINT)
-    # -------------------------------------------------------------------------
+    # 3. SHUTDOWN PHASE
     logger.info("🛑 [Shutdown] Draining connections and freeing application resources...")
 
-    # Gracefully shut down clients and release memory
     await app.state.vector_db.close()
     await app.state.ai_model.unload_weights()
 

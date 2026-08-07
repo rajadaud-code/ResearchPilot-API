@@ -1,6 +1,6 @@
 # 🚀 ResearchPilot API — Autonomous Document Research Engine
 
-An enterprise-grade, asynchronous backend engine built with **FastAPI**, **SQLAlchemy 2.0 (Async)**, **ChromaDB**, **LangGraph / LangChain**, **Celery**, and **Server-Sent Events (SSE)**.
+An enterprise-grade, asynchronous backend engine built with **FastAPI**, **SQLAlchemy 2.0 (Async)**, **Passlib (bcrypt)**, **JWT Authentication**, **ChromaDB**, **LangGraph / LangChain**, **Celery**, and **Server-Sent Events (SSE)**.
 
 Designed specifically for AI Engineers and Node.js/Express developers transitioning to production Python backend development.
 
@@ -9,48 +9,22 @@ Designed specifically for AI Engineers and Node.js/Express developers transition
 ## 🎯 Architecture Overview & Key Concepts
 
 ### 1. FastAPI Lifespan Context Manager (`@asynccontextmanager`)
-In legacy FastAPI (or Express.js setup callbacks), startup and shutdown events were handled via fragmented hooks (`@app.on_event("startup")`). In modern FastAPI, application state is managed using Python's ASGI Lifespan protocol (`@asynccontextmanager`).
+Managed using Python's ASGI Lifespan protocol (`@asynccontextmanager`):
+- Connects database tables and ChromaDB vector store clients at startup.
+- Loads AI models into memory once and stores instances on `app.state`.
+- Flushes DB connection pools and releases resources cleanly on shutdown.
 
-```
-               +-----------------------------------+
-               |        Uvicorn ASGI Server        |
-               +-----------------------------------+
-                                 |
-                     1. Enter Lifespan Context
-                                 v
-        +-------------------------------------------------+
-        |  Startup Phase:                                 |
-        |  - Connect ChromaDB client                       |
-        |  - Load heavy LLM weights into memory           |
-        |  - Initialize SQLAlchemy connection pool       |
-        |  - Store instances on app.state                 |
-        +-------------------------------------------------+
-                                 |
-                             2. yield
-                                 v
-        +-------------------------------------------------+
-        |  Active Server Loop:                            |
-        |  - Process HTTP GET/POST & SSE stream requests  |
-        |  - Inject app.state dependencies into routes    |
-        +-------------------------------------------------+
-                                 |
-                     3. Exit Lifespan Context (Shutdown)
-                                 v
-        +-------------------------------------------------+
-        |  Teardown Phase:                                |
-        |  - Flush DB connection pools                    |
-        |  - Unload AI model memory                       |
-        |  - Close vector store sockets                   |
-        +-------------------------------------------------+
-```
+### 2. JWT Bearer Authentication & OAuth2 Scheme
+- User registration (`POST /api/v1/auth/register`) hashes passwords securely using salted `bcrypt` (`passlib`).
+- User authentication (`POST /api/v1/auth/login`) issues signed JWT access tokens using HMAC-SHA256 (`python-jose`).
+- Protected endpoints declare `current_user: User = Depends(get_current_user)` for declarative, auto-validated user resolution.
 
-### 2. Server-Sent Events (SSE) Streaming for AI Agents
-Standard REST API endpoints wait for the complete LLM response before returning a JSON payload, resulting in poor user experience and high initial latency (TTFT - Time To First Token).
-
-Using `StreamingResponse` with an `AsyncGenerator`:
-1. The AI Agent (`stream_research_agent_response`) yields execution steps and tokens incrementally as python `str` chunks.
-2. The SSE route (`/api/v1/chat/stream`) wraps chunks in W3C compliant formatting: `data: {"token": "..."}\n\n`.
-3. Client disconnects are checked per chunk using `await request.is_disconnected()`, ensuring background LLM calls are aborted immediately if a user navigates away.
+### 3. Authenticated SSE Streaming & Persistent Memory
+- The streaming endpoint (`GET /api/v1/chat/stream`) requires JWT Bearer authentication.
+- Incoming user queries are committed to PostgreSQL (`role="user"`) *before* streaming begins.
+- Generated tokens stream real-time over SSE while accumulating in-memory.
+- Upon completion, the synthesized answer is committed to PostgreSQL (`role="assistant"`).
+- Chat turns are fetched via `GET /api/v1/chat/history` to provide conversational memory windows for LLM agent pipelines.
 
 ---
 
@@ -60,17 +34,17 @@ Using `StreamingResponse` with an `AsyncGenerator`:
 research_pilot/
 ├── app/
 │   ├── api/
-│   │   ├── dependencies.py          # Dependency Injection (DB sessions, app.state)
+│   │   ├── dependencies.py          # OAuth2 scheme, get_current_user, DB sessions
 │   │   ├── routes/              
-│   │   │   ├── auth.py              # Authentication router stub
+│   │   │   ├── auth.py              # User registration & JWT login endpoints
 │   │   │   ├── documents.py         # Vector search & document router
-│   │   │   └── chat.py              # SSE real-time streaming router
+│   │   │   └── chat.py              # Authenticated SSE stream & history routes
 │   │   └── websockets/
 │   │       └── manager.py           # WebSocket connection manager
 │   ├── core/
 │   │   ├── config.py                # Pydantic v2 Settings (.env validation)
-│   │   ├── security.py              # JWT & hashing utilities
-│   │   └── lifespan.py              # ASGI Lifespan (ChromaDB & model init)
+│   │   ├── security.py              # bcrypt hashing & JWT encode/decode
+│   │   └── lifespan.py              # ASGI Lifespan (DB tables, ChromaDB & models)
 │   ├── ai/                      
 │   │   ├── agents/              
 │   │   │   └── research_agent.py    # AsyncGenerator LangGraph agent simulator
@@ -79,9 +53,14 @@ research_pilot/
 │   │   └── prompts.py               # Centralized system prompts
 │   ├── services/                
 │   │   ├── document_svc.py          # Document parsing & chunking service
-│   │   └── ai_svc.py                # AI service abstraction layer
-│   ├── models/                      # SQLAlchemy 2.0 ORM models
-│   ├── schemas/                     # Pydantic validation schemas
+│   │   └── ai_svc.py                # Persistent chat history service methods
+│   ├── models/                      
+│   │   ├── base.py                  # SQLAlchemy 2.0 DeclarativeBase
+│   │   ├── user.py                  # User ORM model
+│   │   └── chat.py                  # ChatMessage ORM model
+│   ├── schemas/                     
+│   │   ├── user_schema.py           # User & Token Pydantic schemas
+│   │   └── chat_schema.py           # Chat & Stream Pydantic schemas
 │   ├── worker/                  
 │   │   ├── celery_app.py            # Celery task queue configuration
 │   │   └── tasks.py                 # Async background tasks (embeddings)
@@ -96,103 +75,55 @@ research_pilot/
 
 ## 🛠️ Step-by-Step Setup Guide
 
-### 1. Prerequisites
-- Python 3.10+ installed
-- PowerShell / Terminal
-
-### 2. Create and Activate Virtual Environment (`venv`)
-Navigate to the project root directory:
-
+### 1. Create and Activate Virtual Environment (`venv`)
 ```bash
 cd research_pilot
-```
-
-Create a virtual environment:
-```bash
 python -m venv venv
+.\venv\Scripts\Activate.ps1  # Windows PowerShell
 ```
 
-Activate the virtual environment:
-- **Windows (PowerShell)**:
-  ```powershell
-  .\venv\Scripts\Activate.ps1
-  ```
-- **Linux / macOS**:
-  ```bash
-  source venv/bin/activate
-  ```
-
-### 3. Install Dependencies
+### 2. Install Dependencies
 ```bash
-pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 4. Configure Environment Variables
-Copy `.env.example` to `.env`:
-```bash
-cp .env.example .env
-```
-
-### 5. Run Development Server using Uvicorn
-Start the FastAPI server with live-reloading:
-
+### 3. Run Development Server using Uvicorn
 ```bash
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Once running:
 - **Swagger Interactive API Documentation**: [http://localhost:8000/docs](http://localhost:8000/docs)
 - **ReDoc Documentation**: [http://localhost:8000/redoc](http://localhost:8000/redoc)
-- **Health Check Endpoint**: [http://localhost:8000/health](http://localhost:8000/health)
 
 ---
 
-## 🧪 Testing SSE Real-Time Stream
+## 🧪 Testing Phase 3 & Phase 4 Endpoints
 
-To verify real-time Server-Sent Events token delivery in your terminal, run `curl` with the unbuffered flag (`-N` / `--no-buffer`):
+### 1. Register a New User Account
+```bash
+curl -X POST "http://localhost:8000/api/v1/auth/register" \
+     -H "Content-Type: application/json" \
+     -d '{"email": "researcher@example.com", "password": "SecurePassword123"}'
+```
+
+### 2. Authenticate & Obtain JWT Access Token
+```bash
+curl -X POST "http://localhost:8000/api/v1/auth/login" \
+     -H "Content-Type: application/x-www-form-urlencoded" \
+     -d "username=researcher@example.com&password=SecurePassword123"
+```
+*Copy the returned `access_token` string.*
+
+### 3. Stream Protected AI Response via SSE
+Pass the Bearer token in the `Authorization` header:
 
 ```bash
-curl -N "http://localhost:8000/api/v1/chat/stream?query=Explain+quantum+computing+architecture"
+curl -N -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+     "http://localhost:8000/api/v1/chat/stream?query=What+is+SQLAlchemy+2.0+async+ORM"
 ```
 
-### Expected Real-Time Response Output:
-```http
-HTTP/1.1 200 OK
-date: Fri, 07 Aug 2026 11:40:00 GMT
-server: uvicorn
-content-type: text/event-stream
-cache-control: no-cache
-connection: keep-alive
-x-accel-buffering: no
-
-data: {"token": "\ud83d\udd0d [Agent Node: Intent Analysis] Formulating research strategy for query: 'Explain quantum computing architecture'...\n", "type": "content"}
-
-data: {"token": "\ud83d\udcda [Agent Node: Vector Search] Retrieving top relevant document chunks from ChromaDB index...\n", "type": "content"}
-
-data: {"token": "\n\ud83e\udd16 [Agent Node: Response Synthesis] Answer:\n", "type": "content"}
-
-data: {"token": "Based ", "type": "content"}
-
-data: {"token": "on ", "type": "content"}
-
-data: {"token": "retrieved ", "type": "content"}
-
-data: {"token": "documentation...", "type": "content"}
-
-event: end
-data: {"type": "end", "status": "completed"}
+### 4. Fetch Persistent Chat History
+```bash
+curl -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+     "http://localhost:8000/api/v1/chat/history"
 ```
-
----
-
-## 💡 Key Architectural Takeaways for Express Developers
-
-| Feature / Concept | Express / Node.js Paradigm | FastAPI / Python Paradigm |
-| :--- | :--- | :--- |
-| **Server Engine** | Node Event Loop (`http.createServer`) | ASGI / Uvicorn (`uvicorn app.main:app`) |
-| **Lifecycle** | Manual `app.listen()` callbacks | `@asynccontextmanager` Lifespan protocol |
-| **Validation & Env** | `dotenv` + `process.env` + Zod/Joi | `pydantic-settings` (`BaseSettings`) |
-| **Request Context** | Mutating `req` (e.g. `req.db = pool`) | Declarative Dependency Injection `Depends(get_db)` |
-| **Real-time Stream** | `res.writeHead()` + `res.write()` | `StreamingResponse` wrapping `AsyncGenerator` |
-| **Task Offloading** | BullMQ / Bee-Queue + Redis | Celery + Redis Task Workers |
