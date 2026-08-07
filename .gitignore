@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables
+.env
+.env.local
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Database & Storage
+*.sqlite3
+*.db
+
+# Celery & Logs
+*.log
+celerybeat-schedule
+celerybeat.pid
+
+# OS generated files
+.DS_Store
+Thumbs.db
